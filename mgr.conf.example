@@ -1,0 +1,27 @@
+# ==============================================================================
+# mgr configuration file (mgr.conf)
+# ==============================================================================
+# Syntax:
+#   short_name = systemd_unit_name : port : description : aliases (optional, comma-separated)
+#
+# Examples:
+#   api    = backend.service        : 8000   : FastAPI Main Backend    : backend,app
+#   db     = mongod.service         : 27017  : MongoDB Database        : mongo
+#   cache  = redis-server.service   : 6379   : Redis Cache             : redis
+#   proxy  = caddy.service          : 80,443 : Caddy Web Server        : web,caddy
+# ==============================================================================
+
+[services]
+# Web & Reverse Proxies
+proxy    = caddy.service          : 80,443 : Caddy Reverse Proxy & SSL   : web,caddy
+
+# Applications & APIs
+api      = sahibe.service         : 8008   : Sahibe PDKS Backend API     : pdks,sahibe-api
+licence  = dagserver.service      : 8085   : DagLicence Server           : dagserver
+mailer   = mailhub.service        : 8086   : MailHub Email Engine        : mailhub
+
+# Databases & Storage
+mongo    = mongod.service         : 27017  : MongoDB 8.0 Database        : mongod,mongodb
+redis    = redis-server.service   : 6379   : Redis In-Memory Store       : redis-server
+minio    = minio.service          : 9000   : MinIO Object Storage        : s3
+postgres = postgresql.service     : 5432   : PostgreSQL Database         : psql,psql-db
