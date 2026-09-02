@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# mgr - Lightweight Systemd Service Manager & Auto-Healing Watchdog
+# mgr - Lightweight Systemd Service Manager, MCP Server & Auto-Healing Watchdog
 # GitHub: https://github.com/poqob/mgr
 # License: MIT
 # ==============================================================================
 
 set -eo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # Colors & Formatting
 RED='\033[0;31m'
@@ -20,7 +20,6 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m' # No Color
 
-# Default log file for watchdog
 LOG_FILE="/var/log/mgr-watchdog.log"
 CRON_FILE="/etc/cron.d/mgr-watchdog"
 
@@ -28,6 +27,7 @@ CRON_FILE="/etc/cron.d/mgr-watchdog"
 CONFIG_PATHS=(
     "${MGR_CONFIG:-}"
     "./mgr.conf"
+    "./mgr.ini"
     "$HOME/.config/mgr/mgr.conf"
     "/etc/mgr/mgr.conf"
     "/etc/mgr.conf"
@@ -37,7 +37,7 @@ ACTIVE_CONFIG=""
 SERVICES=()
 
 # ------------------------------------------------------------------------------
-# Configuration Loader
+# Flexible & Lenient Configuration Loader
 # ------------------------------------------------------------------------------
 find_config() {
     for path in "${CONFIG_PATHS[@]}"; do
@@ -51,20 +51,69 @@ find_config() {
 
 load_services() {
     if ! find_config; then
-        echo -e "${RED}[ERROR] No configuration file (mgr.conf) found.${NC}"
-        echo -e "Run ${BOLD}mgr init${NC} to create a starter configuration file."
+        echo -e "${RED}[ERROR] No configuration file (mgr.conf) found.${NC}" >&2
+        echo -e "Run ${BOLD}mgr init${NC} to create a starter configuration file." >&2
         exit 1
     fi
 
     SERVICES=()
+    local current_section=""
+    local cur_name=""
+    local cur_unit=""
+    local cur_port="-"
+    local cur_desc=""
+    local cur_aliases=""
+
+    flush_ini_service() {
+        if [[ -n "$cur_name" ]]; then
+            local unit="${cur_unit:-$cur_name}"
+            [[ "$unit" != *.* ]] && unit="${unit}.service"
+            SERVICES+=("$cur_name|$unit|${cur_port:--}|${cur_desc:-$cur_name}|$cur_aliases")
+            cur_name="" cur_unit="" cur_port="-" cur_desc="" cur_aliases=""
+        fi
+    }
+
     while IFS= read -r line || [[ -n "$line" ]]; do
         # Trim leading/trailing whitespace
         line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
-        # Skip empty lines, comments, and section headers like [services]
-        [[ -z "$line" || "$line" =~ ^[#\;] || "$line" =~ ^\[.*\] ]] && continue
+        # Skip blank lines or comments
+        [[ -z "$line" || "$line" =~ ^[#\;] ]] && continue
 
-        # Format: name = service.unit : port : description : aliases (optional)
+        # Handle INI section header [section_name]
+        if [[ "$line" =~ ^\[([a-zA-Z0-9_-]+)\]$ ]]; then
+            flush_ini_service
+            local sec="${BASH_REMATCH[1]}"
+            if [[ "$sec" == "services" || "$sec" == "general" || "$sec" == "config" ]]; then
+                current_section=""
+            else
+                current_section="$sec"
+                cur_name="$sec"
+                cur_unit=""
+                cur_port="-"
+                cur_desc="$sec"
+                cur_aliases=""
+            fi
+            continue
+        fi
+
+        # If inside a named section [my-service]
+        if [[ -n "$current_section" ]]; then
+            if [[ "$line" =~ ^([a-zA-Z0-9_-]+)[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+                local k=$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
+                local v=$(echo "${BASH_REMATCH[2]}" | xargs)
+                case "$k" in
+                    unit|service) cur_unit="$v" ;;
+                    port|ports) cur_port="$v" ;;
+                    desc|description) cur_desc="$v" ;;
+                    alias|aliases) cur_aliases="$v" ;;
+                esac
+            fi
+            continue
+        fi
+
+        # Format A: name = unit : port : description : aliases
+        # (Separators can be colon, arbitrary whitespace, or omitted completely!)
         if [[ "$line" =~ ^([a-zA-Z0-9_-]+)[[:space:]]*=[[:space:]]*(.+)$ ]]; then
             local s_name="${BASH_REMATCH[1]}"
             local rest="${BASH_REMATCH[2]}"
@@ -74,19 +123,41 @@ load_services() {
             local s_desc=""
             local s_aliases=""
 
-            IFS=':' read -r s_unit s_port s_desc s_aliases <<< "$rest"
+            if [[ "$rest" == *:* ]]; then
+                IFS=':' read -r s_unit s_port s_desc s_aliases <<< "$rest"
+            elif [[ "$rest" == *,* ]]; then
+                IFS=',' read -r s_unit s_port s_desc s_aliases <<< "$rest"
+            else
+                s_unit="$rest"
+            fi
 
             s_unit=$(echo "${s_unit:-$s_name}" | xargs)
+            [[ "$s_unit" != *.* ]] && s_unit="${s_unit}.service"
+
             s_port=$(echo "${s_port:--}" | xargs)
+            [[ -z "$s_port" ]] && s_port="-"
+
             s_desc=$(echo "${s_desc:-$s_name}" | xargs)
+            [[ -z "$s_desc" ]] && s_desc="$s_name"
+
             s_aliases=$(echo "${s_aliases:-}" | xargs)
 
             SERVICES+=("$s_name|$s_unit|$s_port|$s_desc|$s_aliases")
+
+        # Format B: simple single-word line (e.g. "mongod" or "caddy.service")
+        elif [[ "$line" =~ ^([a-zA-Z0-9_.-]+)$ ]]; then
+            local raw="${BASH_REMATCH[1]}"
+            local s_name="${raw%.service}"
+            local s_unit="$raw"
+            [[ "$s_unit" != *.* ]] && s_unit="${s_unit}.service"
+            SERVICES+=("$s_name|$s_unit|-|$s_name|")
         fi
     done < "$ACTIVE_CONFIG"
 
+    flush_ini_service
+
     if [[ ${#SERVICES[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}[WARNING] No valid services defined in $ACTIVE_CONFIG${NC}"
+        echo -e "${YELLOW}[WARNING] No valid services defined in $ACTIVE_CONFIG${NC}" >&2
     fi
 }
 
@@ -99,7 +170,7 @@ resolve_service() {
         local lower_name=$(echo "$s_name" | tr '[:upper:]' '[:lower:]')
         local lower_unit=$(echo "$s_unit" | tr '[:upper:]' '[:lower:]')
 
-        if [[ "$lower_name" == "$query" || "$lower_unit" == "$query" ]]; then
+        if [[ "$lower_name" == "$query" || "$lower_unit" == "$query" || "${lower_unit%.service}" == "$query" ]]; then
             echo "$s_name"
             return 0
         fi
@@ -135,15 +206,14 @@ get_service_entry() {
 # ------------------------------------------------------------------------------
 # Systemd Helpers
 # ------------------------------------------------------------------------------
-get_memory() {
+get_memory_mb() {
     local unit="$1"
     local mem
     mem=$(systemctl show "$unit" --property=MemoryCurrent 2>/dev/null | cut -d= -f2)
     if [[ -z "$mem" || "$mem" == "[not set]" || "$mem" == "18446744073709551615" || "$mem" -eq 0 ]] 2>/dev/null; then
-        echo "-"
+        echo "0"
     else
-        local mb=$((mem / 1024 / 1024))
-        echo "${mb}MB"
+        echo "$((mem / 1024 / 1024))"
     fi
 }
 
@@ -152,10 +222,65 @@ get_pid() {
     local pid
     pid=$(systemctl show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2)
     if [[ -z "$pid" || "$pid" -eq 0 ]] 2>/dev/null; then
-        echo "-"
+        echo "0"
     else
         echo "$pid"
     fi
+}
+
+# ------------------------------------------------------------------------------
+# JSON Generation Engine
+# ------------------------------------------------------------------------------
+generate_json_status() {
+    local auto_heal="${1:-false}"
+    local json_services="["
+    local first=true
+
+    for entry in "${SERVICES[@]}"; do
+        IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
+        local status="DEAD"
+        local pid=0
+        local mem_mb=0
+
+        if systemctl is-active --quiet "$s_unit"; then
+            status="RUNNING"
+            pid=$(get_pid "$s_unit")
+            mem_mb=$(get_memory_mb "$s_unit")
+        else
+            if [[ "$auto_heal" == "true" ]]; then
+                systemctl --no-ask-password restart "$s_unit" >/dev/null 2>&1 || true
+                sleep 0.4
+                if systemctl is-active --quiet "$s_unit"; then
+                    status="RECOVERED"
+                    pid=$(get_pid "$s_unit")
+                    mem_mb=$(get_memory_mb "$s_unit")
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') [AUTO-HEAL] Recovered crashed service: $s_name ($s_unit)" >> "$LOG_FILE" 2>/dev/null || true
+                else
+                    status="FAILED"
+                fi
+            fi
+        fi
+
+        [[ "$first" == "true" ]] && first=false || json_services+=","
+        json_services+="{\"name\":\"$s_name\",\"unit\":\"$s_unit\",\"status\":\"$status\",\"pid\":$pid,\"memory_mb\":$mem_mb,\"port\":\"$s_port\",\"description\":\"$s_desc\"}"
+    done
+    json_services+="]"
+
+    local free_ram=$(free -h 2>/dev/null | awk '/^Mem:/ {print $7}' || echo "N/A")
+    local total_ram=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}' || echo "N/A")
+    local used_ram=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3}' || echo "N/A")
+
+    cat << EOF
+{
+  "config": "$ACTIVE_CONFIG",
+  "services": $json_services,
+  "system_memory": {
+    "used": "$used_ram",
+    "total": "$total_ram",
+    "available": "$free_ram"
+  }
+}
+EOF
 }
 
 # ------------------------------------------------------------------------------
@@ -164,6 +289,12 @@ get_pid() {
 cmd_status_check() {
     local auto_heal="$1"
     local silent="$2"
+    local json_output="$3"
+
+    if [[ "$json_output" == "true" ]]; then
+        generate_json_status "$auto_heal"
+        return 0
+    fi
 
     if [[ "$silent" != "true" ]]; then
         echo -e "${BOLD}${CYAN}========================================================================${NC}"
@@ -173,8 +304,6 @@ cmd_status_check() {
         printf "%-14s %-12s %-8s %-10s %-10s %-22s\n" "SERVICE" "STATUS" "PID" "MEMORY" "PORT" "DESCRIPTION"
         echo "------------------------------------------------------------------------"
     fi
-
-    local has_crashed=0
 
     for entry in "${SERVICES[@]}"; do
         IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
@@ -187,17 +316,18 @@ cmd_status_check() {
             status="RUNNING"
             color="$GREEN"
             pid=$(get_pid "$s_unit")
-            mem=$(get_memory "$s_unit")
+            local mb=$(get_memory_mb "$s_unit")
+            [[ "$mb" -gt 0 ]] && mem="${mb}MB" || mem="-"
         else
-            has_crashed=1
             if [[ "$auto_heal" == "true" ]]; then
-                systemctl restart "$s_unit" >/dev/null 2>&1 || true
+                systemctl --no-ask-password restart "$s_unit" >/dev/null 2>&1 || true
                 sleep 0.4
                 if systemctl is-active --quiet "$s_unit"; then
                     status="RECOVERED"
                     color="$YELLOW"
                     pid=$(get_pid "$s_unit")
-                    mem=$(get_memory "$s_unit")
+                    local mb=$(get_memory_mb "$s_unit")
+                    [[ "$mb" -gt 0 ]] && mem="${mb}MB" || mem="-"
                     echo "$(date '+%Y-%m-%d %H:%M:%S') [AUTO-HEAL] Recovered crashed service: $s_name ($s_unit)" >> "$LOG_FILE" 2>/dev/null || true
                 else
                     status="FAILED"
@@ -223,12 +353,21 @@ cmd_status_check() {
 }
 
 cmd_start_or_restart() {
-    local target_services=("$@")
+    local json_output="false"
+    local target_services=()
+    for arg in "$@"; do
+        if [[ "$arg" == "--json" || "$arg" == "-j" ]]; then
+            json_output="true"
+        else
+            target_services+=("$arg")
+        fi
+    done
+
     if [[ ${#target_services[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}Restarting all registered services in ${ACTIVE_CONFIG}...${NC}"
+        [[ "$json_output" != "true" ]] && echo -e "${YELLOW}Restarting all registered services in ${ACTIVE_CONFIG}...${NC}"
         for entry in "${SERVICES[@]}"; do
             IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
-            echo -e "  -> Restarting ${BOLD}$s_name${NC} ($s_unit)..."
+            [[ "$json_output" != "true" ]] && echo -e "  -> Restarting ${BOLD}$s_name${NC} ($s_unit)..."
             systemctl restart "$s_unit"
         done
     else
@@ -237,24 +376,34 @@ cmd_start_or_restart() {
             local entry=$(get_service_entry "$resolved" || true)
             if [[ -n "$entry" ]]; then
                 IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
-                echo -e "  -> Starting / Restarting ${BOLD}$s_name${NC} ($s_unit)..."
+                [[ "$json_output" != "true" ]] && echo -e "  -> Starting / Restarting ${BOLD}$s_name${NC} ($s_unit)..."
                 systemctl restart "$s_unit"
             else
-                echo -e "  ${RED}[!] Unknown service: $t${NC}"
+                [[ "$json_output" != "true" ]] && echo -e "  ${RED}[!] Unknown service: $t${NC}"
             fi
         done
     fi
-    echo ""
-    cmd_status_check false false
+
+    [[ "$json_output" != "true" ]] && echo ""
+    cmd_status_check false false "$json_output"
 }
 
 cmd_stop() {
-    local target_services=("$@")
+    local json_output="false"
+    local target_services=()
+    for arg in "$@"; do
+        if [[ "$arg" == "--json" || "$arg" == "-j" ]]; then
+            json_output="true"
+        else
+            target_services+=("$arg")
+        fi
+    done
+
     if [[ ${#target_services[@]} -eq 0 ]]; then
-        echo -e "${RED}Stopping all registered services in ${ACTIVE_CONFIG}...${NC}"
+        [[ "$json_output" != "true" ]] && echo -e "${RED}Stopping all registered services in ${ACTIVE_CONFIG}...${NC}"
         for entry in "${SERVICES[@]}"; do
             IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
-            echo -e "  -> Stopping ${BOLD}$s_name${NC} ($s_unit)..."
+            [[ "$json_output" != "true" ]] && echo -e "  -> Stopping ${BOLD}$s_name${NC} ($s_unit)..."
             systemctl stop "$s_unit"
         done
     else
@@ -263,24 +412,34 @@ cmd_stop() {
             local entry=$(get_service_entry "$resolved" || true)
             if [[ -n "$entry" ]]; then
                 IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
-                echo -e "  -> Stopping ${BOLD}$s_name${NC} ($s_unit)..."
+                [[ "$json_output" != "true" ]] && echo -e "  -> Stopping ${BOLD}$s_name${NC} ($s_unit)..."
                 systemctl stop "$s_unit"
             else
-                echo -e "  ${RED}[!] Unknown service: $t${NC}"
+                [[ "$json_output" != "true" ]] && echo -e "  ${RED}[!] Unknown service: $t${NC}"
             fi
         done
     fi
-    echo ""
-    cmd_status_check false false
+
+    [[ "$json_output" != "true" ]] && echo ""
+    cmd_status_check false false "$json_output"
 }
 
 cmd_kill() {
-    local target_services=("$@")
+    local json_output="false"
+    local target_services=()
+    for arg in "$@"; do
+        if [[ "$arg" == "--json" || "$arg" == "-j" ]]; then
+            json_output="true"
+        else
+            target_services+=("$arg")
+        fi
+    done
+
     if [[ ${#target_services[@]} -eq 0 ]]; then
-        echo -e "${RED}Force killing all registered services...${NC}"
+        [[ "$json_output" != "true" ]] && echo -e "${RED}Force killing all registered services...${NC}"
         for entry in "${SERVICES[@]}"; do
             IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
-            echo -e "  -> Killing ${BOLD}$s_name${NC} ($s_unit)..."
+            [[ "$json_output" != "true" ]] && echo -e "  -> Killing ${BOLD}$s_name${NC} ($s_unit)..."
             systemctl kill -s SIGKILL "$s_unit" 2>/dev/null || true
             systemctl stop "$s_unit" 2>/dev/null || true
         done
@@ -290,27 +449,30 @@ cmd_kill() {
             local entry=$(get_service_entry "$resolved" || true)
             if [[ -n "$entry" ]]; then
                 IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
-                echo -e "  -> Killing ${BOLD}$s_name${NC} ($s_unit)..."
+                [[ "$json_output" != "true" ]] && echo -e "  -> Killing ${BOLD}$s_name${NC} ($s_unit)..."
                 systemctl kill -s SIGKILL "$s_unit" 2>/dev/null || true
                 systemctl stop "$s_unit" 2>/dev/null || true
             else
-                echo -e "  ${RED}[!] Unknown service: $t${NC}"
+                [[ "$json_output" != "true" ]] && echo -e "  ${RED}[!] Unknown service: $t${NC}"
             fi
         done
     fi
-    echo ""
-    cmd_status_check false false
+
+    [[ "$json_output" != "true" ]] && echo ""
+    cmd_status_check false false "$json_output"
 }
 
 cmd_logs() {
     local target="$1"
-    if [[ -z "$target" ]]; then
-        echo -e "${YELLOW}Usage: mgr logs <service_name>${NC}"
-        echo "Registered services in $ACTIVE_CONFIG:"
-        for entry in "${SERVICES[@]}"; do
-            IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
-            echo "  - $s_name ($s_unit)"
-        done
+    local lines="${2:-50}"
+    local json_output="false"
+
+    if [[ "$3" == "--json" || "$3" == "-j" || "$target" == "--json" ]]; then
+        json_output="true"
+    fi
+
+    if [[ -z "$target" || "$target" == "--json" ]]; then
+        echo -e "${YELLOW}Usage: mgr logs <service_name> [lines]${NC}" >&2
         exit 1
     fi
 
@@ -318,10 +480,15 @@ cmd_logs() {
     local entry=$(get_service_entry "$resolved" || true)
     if [[ -n "$entry" ]]; then
         IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
-        echo -e "${CYAN}Streaming live logs for ${BOLD}$s_name${NC} ($s_unit)... (Press Ctrl+C to exit)${NC}"
-        journalctl -u "$s_unit" -n 50 -f
+        if [[ "$json_output" == "true" ]]; then
+            local logs_content=$(journalctl -u "$s_unit" -n "$lines" --no-pager 2>/dev/null | python3 -c 'import sys, json; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""')
+            echo "{\"service\": \"$s_name\", \"unit\": \"$s_unit\", \"lines\": $lines, \"logs\": $logs_content}"
+        else
+            echo -e "${CYAN}Streaming live logs for ${BOLD}$s_name${NC} ($s_unit)... (Press Ctrl+C to exit)${NC}"
+            journalctl -u "$s_unit" -n "$lines" -f
+        fi
     else
-        echo -e "${RED}[!] Unknown service: $target${NC}"
+        echo -e "${RED}[!] Unknown service: $target${NC}" >&2
         exit 1
     fi
 }
@@ -335,22 +502,29 @@ cmd_init() {
 
     cat << 'EOF' > "$target_file"
 # ==============================================================================
-# mgr configuration file
-# Syntax: name = systemd_unit_name : port : description : aliases (optional)
+# mgr configuration file (mgr.conf)
+# ==============================================================================
+# Simple, flexible syntax. Examples:
+#
+#   api      = my-backend.service : 8000   : FastAPI Main Backend : backend,server
+#   db       = mongod.service     : 27017  : MongoDB Database     : mongo
+#   cache    = redis-server       : 6379   : Redis Store          : redis
+#   proxy    = caddy              : 80,443 : Web Proxy            : web
+#
+# Even simpler:
+#   my-app   = my-app.service
+#   nginx
 # ==============================================================================
 
 [services]
-# Web & Proxy
-caddy      = caddy.service           : 80,443   : Caddy Reverse Proxy   : web,proxy
-# Backend APIs
-api        = my-backend.service      : 8000     : Primary REST API      : backend,server
-# Databases & Caches
-redis      = redis-server.service    : 6379     : Redis Cache           : cache
-postgres   = postgresql.service      : 5432     : PostgreSQL DB         : db,psql
+caddy      = caddy.service        : 80,443   : Caddy Reverse Proxy & SSL : web,proxy
+api        = my-backend.service   : 8000     : Primary REST API          : backend,app
+redis      = redis-server.service : 6379     : Redis Cache Store         : cache
+postgres   = postgresql.service   : 5432     : PostgreSQL Database       : db,psql
 EOF
 
-    echo -e "${GREEN}✓ Created sample configuration at ${BOLD}$target_file${NC}"
-    echo "Edit this file to include your systemd services, then run 'mgr' to manage them."
+    echo -e "${GREEN}✓ Created starter configuration at ${BOLD}$target_file${NC}"
+    echo "Edit this file to list your services, then run 'mgr' to manage them."
 }
 
 cmd_install_watchdog() {
@@ -379,8 +553,276 @@ cmd_uninstall_watchdog() {
     echo -e "${GREEN}✓ Watchdog cron job removed.${NC}"
 }
 
+# ------------------------------------------------------------------------------
+# Model Context Protocol (MCP) Server Handler (JSON-RPC 2.0 over stdio)
+# ------------------------------------------------------------------------------
+cmd_mcp_server() {
+    load_services
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR] python3 is required to run the stdio MCP server.${NC}" >&2
+        exit 1
+    fi
+
+    read -r -d '' MCP_PY_SCRIPT << 'PYEOF' || true
+import sys
+import json
+import subprocess
+import os
+
+MGR_EXEC = os.environ.get("MGR_PATH", "mgr")
+
+TOOLS = [
+    {
+        "name": "list_services",
+        "description": "Returns the live status, PID, memory usage (MB), ports, and descriptions of all system services managed by mgr.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "auto_heal": {
+                    "type": "boolean",
+                    "description": "If true, automatically restart any dead or crashed services."
+                }
+            }
+        }
+    },
+    {
+        "name": "restart_service",
+        "description": "Restarts a specific service (or all services if no service name is specified).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": "The short name or alias of the service (e.g. 'api', 'db', 'caddy'). Leave empty to restart all."
+                }
+            }
+        }
+    },
+    {
+        "name": "stop_service",
+        "description": "Gracefully stops a specific service (or all services if omitted).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": "The service name or alias to stop."
+                }
+            }
+        }
+    },
+    {
+        "name": "kill_service",
+        "description": "Forcefully terminates (SIGKILL) a service process.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": "The service name to force-kill."
+                }
+            }
+        }
+    },
+    {
+        "name": "get_service_logs",
+        "description": "Fetches the recent systemd/journalctl logs for a specific service.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": "The service name to fetch logs for."
+                },
+                "lines": {
+                    "type": "integer",
+                    "description": "Number of log lines to retrieve (default: 50)."
+                }
+            },
+            "required": ["service"]
+        }
+    },
+    {
+        "name": "auto_heal_services",
+        "description": "Scans all registered services and automatically restarts any crashed or inactive services.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    }
+]
+
+def run_mgr_json(args):
+    cmd = [MGR_EXEC] + args + ["--json"]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        return json.loads(res.stdout)
+    except Exception as e:
+        return {"error": str(e), "raw": res.stderr if 'res' in locals() else ""}
+
+def handle_request(req):
+    req_id = req.get("id")
+    method = req.get("method")
+    params = req.get("params", {})
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "mgr-mcp-server",
+                    "version": "1.1.0"
+                }
+            }
+        }
+
+    elif method == "notifications/initialized":
+        return None
+
+    elif method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": TOOLS
+            }
+        }
+
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+
+        if tool_name == "list_services":
+            auto_heal = arguments.get("auto_heal", False)
+            data = run_mgr_json(["--check"] if not auto_heal else [])
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(data, indent=2)}]
+                }
+            }
+
+        elif tool_name == "restart_service":
+            srv = arguments.get("service", "")
+            cmd_args = ["-r"]
+            if srv:
+                cmd_args.append(srv)
+            data = run_mgr_json(cmd_args)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(data, indent=2)}]
+                }
+            }
+
+        elif tool_name == "stop_service":
+            srv = arguments.get("service", "")
+            cmd_args = ["-s"]
+            if srv:
+                cmd_args.append(srv)
+            data = run_mgr_json(cmd_args)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(data, indent=2)}]
+                }
+            }
+
+        elif tool_name == "kill_service":
+            srv = arguments.get("service", "")
+            cmd_args = ["-k"]
+            if srv:
+                cmd_args.append(srv)
+            data = run_mgr_json(cmd_args)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(data, indent=2)}]
+                }
+            }
+
+        elif tool_name == "get_service_logs":
+            srv = arguments.get("service", "")
+            lines = str(arguments.get("lines", 50))
+            try:
+                res = subprocess.run([MGR_EXEC, "logs", srv, lines, "--json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                data = json.loads(res.stdout) if res.stdout.strip().startswith("{") else {"raw_logs": res.stdout}
+            except Exception as e:
+                data = {"error": str(e)}
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(data, indent=2)}]
+                }
+            }
+
+        elif tool_name == "auto_heal_services":
+            data = run_mgr_json([])
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(data, indent=2)}]
+                }
+            }
+
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
+            }
+
+    elif method == "ping":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+
+    else:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"}
+        }
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            resp = handle_request(req)
+            if resp is not None:
+                sys.stdout.write(json.dumps(resp) + "\n")
+                sys.stdout.flush()
+        except Exception as e:
+            err_resp = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": f"Parse error: {str(e)}"}
+            }
+            sys.stdout.write(json.dumps(err_resp) + "\n")
+            sys.stdout.flush()
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+    python3 -c "$MCP_PY_SCRIPT"
+}
+
 show_help() {
-    echo -e "${BOLD}mgr - Unified Systemd Service Manager & Auto-Healing Watchdog${NC} (v${VERSION})"
+    echo -e "${BOLD}mgr - Unified Systemd Service Manager, MCP Server & Watchdog${NC} (v${VERSION})"
     echo ""
     echo -e "${BOLD}USAGE:${NC}"
     echo "  mgr [COMMAND] [OPTIONS] [SERVICES...]"
@@ -393,18 +835,23 @@ show_help() {
     echo "  kill, -k              Force kill (SIGKILL) specified services (or ALL if omitted)"
     echo "  logs, -l <service>    Live tail logs for a specific service"
     echo "  watchdog, -w          Silent watchdog check for cron/timer (auto-restarts dead ones)"
+    echo "  mcp                   Start standard stdio Model Context Protocol (MCP) server for AI Agents"
     echo "  init                  Create a sample mgr.conf in the current directory"
     echo "  install-watchdog      Install 1-minute auto-healing cron job"
     echo "  uninstall-watchdog    Remove auto-healing cron job"
     echo "  version, -v           Show version information"
     echo "  help, -h              Show this help message"
     echo ""
+    echo -e "${BOLD}GLOBAL OPTIONS:${NC}"
+    echo "  --json, -j            Output response as structured JSON (compatible with scripts & AI agents)"
+    echo ""
     echo -e "${BOLD}EXAMPLES:${NC}"
     echo "  mgr                           # Check health & auto-heal all services"
+    echo "  mgr --json                    # Get full status as structured JSON"
     echo "  mgr restart api db            # Restart only 'api' and 'db' services"
     echo "  mgr stop caddy                # Stop caddy reverse proxy"
-    echo "  mgr logs api                  # Tail live logs for 'api'"
-    echo "  mgr -k redis                  # Force kill redis"
+    echo "  mgr logs api 100              # Tail last 100 lines for 'api'"
+    echo "  mgr mcp                       # Run as an MCP Server (for Claude, Cursor, Antigravity)"
     echo ""
     echo -e "${BOLD}CONFIG SEARCH ORDER:${NC}"
     echo "  1. \$MGR_CONFIG (Environment variable)"
@@ -418,13 +865,25 @@ show_help() {
 # ------------------------------------------------------------------------------
 # Entry Point & Option Parsing
 # ------------------------------------------------------------------------------
-if [[ $# -eq 0 ]]; then
+JSON_MODE="false"
+
+# Check if global --json or -j flag is present
+FILTERED_ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == "--json" || "$arg" == "-j" ]]; then
+        JSON_MODE="true"
+    else
+        FILTERED_ARGS+=("$arg")
+    fi
+done
+
+if [[ ${#FILTERED_ARGS[@]} -eq 0 ]]; then
     load_services
-    cmd_status_check true false
+    cmd_status_check true false "$JSON_MODE"
     exit 0
 fi
 
-case "$1" in
+case "${FILTERED_ARGS[0]}" in
     init)
         cmd_init
         exit 0
@@ -437,8 +896,16 @@ case "$1" in
         cmd_uninstall_watchdog
         exit 0
         ;;
+    mcp)
+        cmd_mcp_server
+        exit 0
+        ;;
     version|-v|--version)
-        echo "mgr version $VERSION"
+        if [[ "$JSON_MODE" == "true" ]]; then
+            echo "{\"version\": \"$VERSION\"}"
+        else
+            echo "mgr version $VERSION"
+        fi
         exit 0
         ;;
     help|-h|--help)
@@ -446,43 +913,38 @@ case "$1" in
         exit 0
         ;;
     -r|--restart|restart|up|start)
-        shift
         load_services
-        cmd_start_or_restart "$@"
+        cmd_start_or_restart "${FILTERED_ARGS[@]:1}" "$([ "$JSON_MODE" == "true" ] && echo "--json")"
         exit 0
         ;;
     -s|--shutdown|--stop|stop|down)
-        shift
         load_services
-        cmd_stop "$@"
+        cmd_stop "${FILTERED_ARGS[@]:1}" "$([ "$JSON_MODE" == "true" ] && echo "--json")"
         exit 0
         ;;
     -k|--kill|kill)
-        shift
         load_services
-        cmd_kill "$@"
+        cmd_kill "${FILTERED_ARGS[@]:1}" "$([ "$JSON_MODE" == "true" ] && echo "--json")"
         exit 0
         ;;
     -l|--logs|logs|log)
-        shift
         load_services
-        cmd_logs "$@"
+        cmd_logs "${FILTERED_ARGS[1]}" "${FILTERED_ARGS[2]}" "$([ "$JSON_MODE" == "true" ] && echo "--json")"
         exit 0
         ;;
     -w|--watchdog|watchdog)
         load_services
-        cmd_status_check true true
+        cmd_status_check true true false
         exit 0
         ;;
     -c|--check|check|status)
         load_services
-        cmd_status_check true false
+        cmd_status_check true false "$JSON_MODE"
         exit 0
         ;;
     *)
-        # If user passes service name directly e.g. "mgr api" -> restart/status or unknown
         load_services
-        cmd_start_or_restart "$@"
+        cmd_start_or_restart "${FILTERED_ARGS[@]}" "$([ "$JSON_MODE" == "true" ] && echo "--json")"
         exit 0
         ;;
 esac
