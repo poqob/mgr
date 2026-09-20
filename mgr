@@ -675,6 +675,172 @@ cmd_uninstall_watchdog() {
     fi
 }
 
+cmd_list_services() {
+    load_services 2>/dev/null || true
+    local items=()
+    for entry in "${SERVICES[@]}"; do
+        IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
+        items+=("$s_name")
+        if [[ -n "$s_aliases" ]]; then
+            IFS=',' read -ra alias_arr <<< "$s_aliases"
+            for a in "${alias_arr[@]}"; do
+                local clean_a=$(echo "$a" | xargs)
+                [[ -n "$clean_a" ]] && items+=("$clean_a")
+            done
+        fi
+    done
+    printf "%s\n" "${items[@]}" | awk '!seen[$0]++' | tr '\n' ' '
+    echo ""
+}
+
+cmd_completion() {
+    local shell="${1:-bash}"
+    case "$shell" in
+        bash)
+            cat << 'EOF'
+# bash completion for mgr
+_mgr() {
+    local cur prev words cword
+    if declare -F _init_completion >/dev/null 2>&1; then
+        _init_completion || return
+    else
+        COMPREPLY=()
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        words=("${COMP_WORDS[@]}")
+        cword=$COMP_CWORD
+    fi
+
+    local commands="up start down stop restart kill logs watchdog mcp init install-watchdog uninstall-watchdog install-completion completion version help check status"
+    local flags="--json -j --help -h --version -v"
+
+    local services
+    services=$(mgr --list-services 2>/dev/null)
+
+    case "$prev" in
+        logs|-l)
+            COMPREPLY=( $(compgen -W "$services" -- "$cur") )
+            return 0
+            ;;
+        restart|-r|start|up|stop|-s|down|kill|-k)
+            COMPREPLY=( $(compgen -W "$services" -- "$cur") )
+            return 0
+            ;;
+        completion)
+            COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
+            return 0
+            ;;
+    esac
+
+    # First argument completion
+    if [[ $cword -eq 1 ]]; then
+        if [[ "$cur" == -* ]]; then
+            COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
+        else
+            COMPREPLY=( $(compgen -W "$commands $services" -- "$cur") )
+        fi
+        return 0
+    fi
+
+    # Subsequent arguments for multi-service actions
+    local first_cmd="${words[1]}"
+    case "$first_cmd" in
+        restart|-r|start|up|stop|-s|down|kill|-k)
+            COMPREPLY=( $(compgen -W "$services" -- "$cur") )
+            return 0
+            ;;
+        logs|-l)
+            if [[ $cword -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "$services" -- "$cur") )
+            elif [[ $cword -eq 3 ]]; then
+                COMPREPLY=( $(compgen -W "10 20 50 100 200 500" -- "$cur") )
+            fi
+            return 0
+            ;;
+    esac
+
+    COMPREPLY=( $(compgen -W "$services" -- "$cur") )
+}
+complete -F _mgr mgr
+EOF
+            ;;
+        zsh)
+            cat << 'EOF'
+#compdef mgr
+
+_mgr() {
+    local -a commands
+    commands=(
+        'start:Start or restart services'
+        'stop:Stop services'
+        'restart:Restart services'
+        'kill:Force kill services'
+        'logs:Tail service logs'
+        'status:Show status overview'
+        'watchdog:Run auto-healing watchdog check'
+        'mcp:Start Model Context Protocol server'
+        'init:Create a starter mgr.conf'
+        'install-watchdog:Install cron watchdog'
+        'uninstall-watchdog:Remove cron watchdog'
+        'install-completion:Install shell tab-completion'
+        'completion:Generate shell completion script'
+        'version:Show version'
+        'help:Show help'
+    )
+
+    local -a services
+    services=(${(f)"$(mgr --list-services 2>/dev/null | tr ' ' '\n')"})
+
+    _arguments -C \
+        '(-j --json)'{-j,--json}'[Output structured JSON]' \
+        '(-h --help)'{-h,--help}'[Show help]' \
+        '(-v --version)'{-v,--version}'[Show version]' \
+        '1: :->cmd' \
+        '*:: :->args'
+
+    case $state in
+        cmd)
+            _describe -t commands 'mgr command' commands
+            _values 'services' $services
+            ;;
+        args)
+            case $words[1] in
+                restart|-r|start|up|stop|-s|down|kill|-k)
+                    _values 'services' $services
+                    ;;
+                logs|-l)
+                    _values 'services' $services
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_mgr "$@"
+EOF
+            ;;
+        *)
+            echo "Unsupported shell: $shell (supported: bash, zsh)" >&2
+            return 1
+            ;;
+    esac
+}
+
+cmd_install_completion() {
+    local target_dir="${HOME}/.local/share/bash-completion/completions"
+    mkdir -p "$target_dir"
+    cmd_completion bash > "$target_dir/mgr"
+    echo -e "${GREEN}✓ Bash completion script installed to ${BOLD}$target_dir/mgr${NC}"
+
+    # Also register in ~/.bashrc if not already present
+    if ! grep -q "bash-completion/completions/mgr" "${HOME}/.bashrc" 2>/dev/null; then
+        echo -e "\n# mgr bash completion\n[ -f \"\$HOME/.local/share/bash-completion/completions/mgr\" ] && source \"\$HOME/.local/share/bash-completion/completions/mgr\"" >> "${HOME}/.bashrc"
+    fi
+
+    echo -e "${GREEN}✓ Registered completion in ${BOLD}~/.bashrc${NC}"
+    echo -e "${CYAN}Run: ${BOLD}source ~/.bashrc${NC} or open a new terminal session to use tab completion immediately!${NC}"
+}
+
 # ------------------------------------------------------------------------------
 # Model Context Protocol (MCP) Server Handler (JSON-RPC 2.0 over stdio)
 # ------------------------------------------------------------------------------
@@ -961,6 +1127,8 @@ show_help() {
     echo "  init                  Create a sample mgr.conf in the current directory"
     echo "  install-watchdog      Install 1-minute auto-healing cron job"
     echo "  uninstall-watchdog    Remove auto-healing cron job"
+    echo "  install-completion    Install shell tab completion (Bash/Zsh)"
+    echo "  completion [bash|zsh] Output shell completion script to stdout"
     echo "  version, -v           Show version information"
     echo "  help, -h              Show this help message"
     echo ""
@@ -973,6 +1141,7 @@ show_help() {
     echo "  mgr restart api db            # Restart only 'api' and 'db' services"
     echo "  mgr stop caddy                # Stop caddy reverse proxy"
     echo "  mgr logs api 100              # Tail last 100 lines for 'api'"
+    echo "  mgr install-completion        # Install auto tab completion for bash"
     echo "  mgr mcp                       # Run as an MCP Server (for Claude, Cursor, Antigravity)"
     echo ""
     echo -e "${BOLD}CONFIG SEARCH ORDER:${NC}"
@@ -1016,6 +1185,18 @@ case "${FILTERED_ARGS[0]}" in
         ;;
     uninstall-watchdog)
         cmd_uninstall_watchdog
+        exit 0
+        ;;
+    install-completion)
+        cmd_install_completion
+        exit 0
+        ;;
+    completion)
+        cmd_completion "${FILTERED_ARGS[1]:-bash}"
+        exit 0
+        ;;
+    --list-services)
+        cmd_list_services
         exit 0
         ;;
     mcp)
