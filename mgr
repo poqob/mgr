@@ -7,7 +7,7 @@
 
 set -eo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # Colors & Formatting
 RED='\033[0;31m'
@@ -308,10 +308,25 @@ check_service_health() {
 # ------------------------------------------------------------------------------
 generate_json_status() {
     local auto_heal="${1:-false}"
+    shift 1 2>/dev/null || true
+    local target_services=("$@")
+
+    local entries_to_process=()
+    if [[ ${#target_services[@]} -gt 0 ]]; then
+        for t in "${target_services[@]}"; do
+            [[ -z "$t" ]] && continue
+            local resolved=$(resolve_service "$t")
+            local entry=$(get_service_entry "$resolved" || true)
+            [[ -n "$entry" ]] && entries_to_process+=("$entry")
+        done
+    else
+        entries_to_process=("${SERVICES[@]}")
+    fi
+
     local json_services="["
     local first=true
 
-    for entry in "${SERVICES[@]}"; do
+    for entry in "${entries_to_process[@]}"; do
         IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
         local status="DEAD"
         local pid=0
@@ -349,6 +364,8 @@ generate_json_status() {
                 else
                     status="FAILED"
                 fi
+            else
+                status="INACTIVE"
             fi
         fi
 
@@ -374,6 +391,90 @@ generate_json_status() {
 EOF
 }
 
+show_single_service_card() {
+    local entry="$1"
+    local auto_heal="${2:-false}"
+
+    IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
+    local status="DEAD"
+    local color="$RED"
+    local pid="-"
+    local mem="-"
+
+    local s_ctl=$(get_sysctl_cmd "$s_unit")
+    local j_ctl=$(get_journctl_cmd "$s_unit")
+
+    if $s_ctl is-active --quiet "$s_unit"; then
+        if ! check_service_health "$s_name" "$s_unit" "$s_port"; then
+            if [[ "$auto_heal" == "true" ]]; then
+                $s_ctl --no-ask-password restart "$s_unit" >/dev/null 2>&1 || true
+                sleep 0.8
+                if $s_ctl is-active --quiet "$s_unit" && check_service_health "$s_name" "$s_unit" "$s_port"; then
+                    status="RECOVERED"
+                    color="$YELLOW"
+                else
+                    status="DEGRADED"
+                    color="$YELLOW"
+                fi
+            else
+                status="DEGRADED"
+                color="$YELLOW"
+            fi
+        else
+            status="RUNNING"
+            color="$GREEN"
+        fi
+        pid=$(get_pid "$s_unit")
+        local mb=$(get_memory_mb "$s_unit")
+        [[ "$mb" -gt 0 ]] && mem="${mb}MB" || mem="-"
+    else
+        if [[ "$auto_heal" == "true" ]]; then
+            $s_ctl --no-ask-password restart "$s_unit" >/dev/null 2>&1 || true
+            sleep 0.4
+            if $s_ctl is-active --quiet "$s_unit"; then
+                status="RECOVERED"
+                color="$YELLOW"
+                pid=$(get_pid "$s_unit")
+                local mb=$(get_memory_mb "$s_unit")
+                [[ "$mb" -gt 0 ]] && mem="${mb}MB" || mem="-"
+            else
+                status="FAILED"
+                color="$RED"
+            fi
+        else
+            status="INACTIVE"
+            color="$DIM"
+        fi
+    fi
+
+    local active_since=$($s_ctl show "$s_unit" -p ActiveEnterTimestamp --value 2>/dev/null || echo "")
+    [[ -z "$active_since" || "$active_since" == "0" ]] && active_since="N/A"
+
+    echo -e "${BOLD}${CYAN}========================================================================${NC}"
+    echo -e "  ${color}●${NC} ${BOLD}${s_name}${NC} (${s_unit}) - ${s_desc}"
+    echo -e "${BOLD}${CYAN}========================================================================${NC}"
+    printf "  %-14s: ${color}%s${NC}\n" "Status" "$status"
+    printf "  %-14s: %s\n" "PID" "$pid"
+    printf "  %-14s: %s\n" "Memory" "$mem"
+    printf "  %-14s: %s\n" "Port(s)" "${s_port:-N/A}"
+    printf "  %-14s: %s\n" "Active Since" "$active_since"
+    if [[ -n "$s_aliases" ]]; then
+        printf "  %-14s: %s\n" "Aliases" "$s_aliases"
+    fi
+    echo -e "${DIM}------------------------------------------------------------------------${NC}"
+    echo -e "  ${BOLD}Recent Logs (last 5 lines):${NC}"
+    local logs_preview=$($j_ctl -n 5 --no-pager 2>/dev/null || true)
+    if [[ -n "$logs_preview" ]]; then
+        while IFS= read -r log_line; do
+            echo -e "  ${DIM}${log_line}${NC}"
+        done <<< "$logs_preview"
+    else
+        echo -e "  ${DIM}(No logs available)${NC}"
+    fi
+    echo -e "${BOLD}${CYAN}========================================================================${NC}"
+    echo ""
+}
+
 # ------------------------------------------------------------------------------
 # CLI Actions
 # ------------------------------------------------------------------------------
@@ -381,22 +482,62 @@ cmd_status_check() {
     local auto_heal="$1"
     local silent="$2"
     local json_output="$3"
+    shift 3 2>/dev/null || true
+
+    local target_services=()
+    for arg in "$@"; do
+        [[ -z "$arg" ]] && continue
+        if [[ "$arg" == "--json" || "$arg" == "-j" ]]; then
+            json_output="true"
+        else
+            target_services+=("$arg")
+        fi
+    done
+
+    # Resolve target services if provided
+    local entries_to_process=()
+    if [[ ${#target_services[@]} -gt 0 ]]; then
+        for t in "${target_services[@]}"; do
+            local resolved=$(resolve_service "$t")
+            local entry=$(get_service_entry "$resolved" || true)
+            if [[ -n "$entry" ]]; then
+                entries_to_process+=("$entry")
+            else
+                [[ "$silent" != "true" && "$json_output" != "true" ]] && echo -e "  ${RED}[!] Unknown service: $t${NC}" >&2
+            fi
+        done
+        if [[ ${#entries_to_process[@]} -eq 0 ]]; then
+            return 1
+        fi
+    else
+        entries_to_process=("${SERVICES[@]}")
+    fi
 
     if [[ "$json_output" == "true" ]]; then
-        generate_json_status "$auto_heal"
+        generate_json_status "$auto_heal" "${target_services[@]}"
+        return 0
+    fi
+
+    # If exactly ONE service is targeted and not silent, display rich detailed card!
+    if [[ ${#entries_to_process[@]} -eq 1 && "$silent" != "true" ]]; then
+        show_single_service_card "${entries_to_process[0]}" "$auto_heal"
         return 0
     fi
 
     if [[ "$silent" != "true" ]]; then
         echo -e "${BOLD}${CYAN}========================================================================${NC}"
         echo -e "${BOLD}${CYAN}           mgr - Services Status & Health Overview                      ${NC}"
-        echo -e "${DIM}  Config: ${ACTIVE_CONFIG}${NC}"
+        if [[ ${#target_services[@]} -gt 0 ]]; then
+            echo -e "${DIM}  Config: ${ACTIVE_CONFIG} (${#entries_to_process[@]} service(s) selected)${NC}"
+        else
+            echo -e "${DIM}  Config: ${ACTIVE_CONFIG}${NC}"
+        fi
         echo -e "${BOLD}${CYAN}========================================================================${NC}"
         printf "%-14s %-12s %-8s %-10s %-10s %-22s\n" "SERVICE" "STATUS" "PID" "MEMORY" "PORT" "DESCRIPTION"
         echo "------------------------------------------------------------------------"
     fi
 
-    for entry in "${SERVICES[@]}"; do
+    for entry in "${entries_to_process[@]}"; do
         IFS='|' read -r s_name s_unit s_port s_desc s_aliases <<< "$entry"
         local status="DEAD"
         local color="$RED"
@@ -445,6 +586,9 @@ cmd_status_check() {
                     color="$RED"
                     echo "$(date '+%Y-%m-%d %H:%M:%S') [ALERT] Failed to start service: $s_name ($s_unit)" >> "$LOG_FILE" 2>/dev/null || true
                 fi
+            else
+                status="INACTIVE"
+                color="$DIM"
             fi
         fi
 
@@ -499,7 +643,11 @@ cmd_start_or_restart() {
     fi
 
     [[ "$json_output" != "true" ]] && echo ""
-    cmd_status_check false false "$json_output"
+    if [[ ${#target_services[@]} -gt 0 ]]; then
+        cmd_status_check false false "$json_output" "${target_services[@]}"
+    else
+        cmd_status_check false false "$json_output"
+    fi
 }
 
 cmd_stop() {
@@ -538,7 +686,11 @@ cmd_stop() {
     fi
 
     [[ "$json_output" != "true" ]] && echo ""
-    cmd_status_check false false "$json_output"
+    if [[ ${#target_services[@]} -gt 0 ]]; then
+        cmd_status_check false false "$json_output" "${target_services[@]}"
+    else
+        cmd_status_check false false "$json_output"
+    fi
 }
 
 cmd_kill() {
@@ -579,7 +731,11 @@ cmd_kill() {
     fi
 
     [[ "$json_output" != "true" ]] && echo ""
-    cmd_status_check false false "$json_output"
+    if [[ ${#target_services[@]} -gt 0 ]]; then
+        cmd_status_check false false "$json_output" "${target_services[@]}"
+    else
+        cmd_status_check false false "$json_output"
+    fi
 }
 
 cmd_logs() {
@@ -711,45 +867,37 @@ _mgr() {
         cword=$COMP_CWORD
     fi
 
-    local commands="up start down stop restart kill logs watchdog mcp init install-watchdog uninstall-watchdog install-completion completion version help check status"
+    local commands="status check start stop restart kill logs up down watchdog mcp init install-watchdog uninstall-watchdog install-completion completion version help"
     local flags="--json -j --help -h --version -v"
+
+    # First argument completion: ONLY commands or flags
+    if [[ $cword -eq 1 ]]; then
+        if [[ "$cur" == -* ]]; then
+            COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
+        else
+            COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+        fi
+        return 0
+    fi
 
     local services
     services=$(mgr --list-services 2>/dev/null)
 
     case "$prev" in
-        logs|-l)
-            COMPREPLY=( $(compgen -W "$services" -- "$cur") )
-            return 0
-            ;;
-        restart|-r|start|up|stop|-s|down|kill|-k)
-            COMPREPLY=( $(compgen -W "$services" -- "$cur") )
-            return 0
-            ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
             return 0
             ;;
     esac
 
-    # First argument completion
-    if [[ $cword -eq 1 ]]; then
-        if [[ "$cur" == -* ]]; then
-            COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
-        else
-            COMPREPLY=( $(compgen -W "$commands $services" -- "$cur") )
-        fi
-        return 0
-    fi
-
-    # Subsequent arguments for multi-service actions
+    # Subsequent arguments for service actions
     local first_cmd="${words[1]}"
     case "$first_cmd" in
-        restart|-r|start|up|stop|-s|down|kill|-k)
+        status|check|-c|restart|-r|start|up|stop|-s|down|kill|-k)
             COMPREPLY=( $(compgen -W "$services" -- "$cur") )
             return 0
             ;;
-        logs|-l)
+        logs|-l|log)
             if [[ $cword -eq 2 ]]; then
                 COMPREPLY=( $(compgen -W "$services" -- "$cur") )
             elif [[ $cword -eq 3 ]]; then
@@ -757,9 +905,11 @@ _mgr() {
             fi
             return 0
             ;;
+        completion)
+            COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
+            return 0
+            ;;
     esac
-
-    COMPREPLY=( $(compgen -W "$services" -- "$cur") )
 }
 complete -F _mgr mgr
 EOF
@@ -771,12 +921,13 @@ EOF
 _mgr() {
     local -a commands
     commands=(
-        'start:Start or restart services'
+        'status:Show service status overview or detailed card'
+        'check:Healthcheck and status overview'
+        'start:Start services'
         'stop:Stop services'
         'restart:Restart services'
         'kill:Force kill services'
         'logs:Tail service logs'
-        'status:Show status overview'
         'watchdog:Run auto-healing watchdog check'
         'mcp:Start Model Context Protocol server'
         'init:Create a starter mgr.conf'
@@ -801,15 +952,21 @@ _mgr() {
     case $state in
         cmd)
             _describe -t commands 'mgr command' commands
-            _values 'services' $services
             ;;
         args)
             case $words[1] in
-                restart|-r|start|up|stop|-s|down|kill|-k)
+                status|check|restart|-r|start|up|stop|-s|down|kill|-k)
                     _values 'services' $services
                     ;;
-                logs|-l)
-                    _values 'services' $services
+                logs|-l|log)
+                    if (( CURRENT == 2 )); then
+                        _values 'services' $services
+                    elif (( CURRENT == 3 )); then
+                        _values 'lines' 10 20 50 100 200 500
+                    fi
+                    ;;
+                completion)
+                    _values 'shell' bash zsh
                     ;;
             esac
             ;;
@@ -1116,11 +1273,12 @@ show_help() {
     echo "  mgr [COMMAND] [OPTIONS] [SERVICES...]"
     echo ""
     echo -e "${BOLD}COMMANDS:${NC}"
-    echo "  (no args)             Check all services, display health table, auto-heal dead ones"
-    echo "  up, start, -r         Start or Restart specified services (or ALL if omitted)"
-    echo "  down, stop, -s        Stop specified services (or ALL if omitted)"
-    echo "  restart, -r           Restart specified services (or ALL if omitted)"
-    echo "  kill, -k              Force kill (SIGKILL) specified services (or ALL if omitted)"
+    echo "  (no args)             Check all services, display health overview table"
+    echo "  status, check         Check status (all services, or detailed card for specific service)"
+    echo "  start, up             Start specified service(s) (or ALL if omitted)"
+    echo "  stop, down            Stop specified service(s) (or ALL if omitted)"
+    echo "  restart, -r           Restart specified service(s) (or ALL if omitted)"
+    echo "  kill, -k              Force kill (SIGKILL) specified service(s) (or ALL if omitted)"
     echo "  logs, -l <service>    Live tail logs for a specific service"
     echo "  watchdog, -w          Silent watchdog check for cron/timer (auto-restarts dead ones)"
     echo "  mcp                   Start standard stdio Model Context Protocol (MCP) server for AI Agents"
@@ -1137,11 +1295,13 @@ show_help() {
     echo ""
     echo -e "${BOLD}EXAMPLES:${NC}"
     echo "  mgr                           # Check health & auto-heal all services"
-    echo "  mgr --json                    # Get full status as structured JSON"
-    echo "  mgr restart api db            # Restart only 'api' and 'db' services"
+    echo "  mgr status caddy              # View detailed card & recent logs for 'caddy'"
+    echo "  mgr restart caddy             # Restart only 'caddy'"
+    echo "  mgr restart caddy redis       # Restart 'caddy' and 'redis'"
     echo "  mgr stop caddy                # Stop caddy reverse proxy"
-    echo "  mgr logs api 100              # Tail last 100 lines for 'api'"
-    echo "  mgr install-completion        # Install auto tab completion for bash"
+    echo "  mgr logs caddy 100            # Tail last 100 lines for 'caddy'"
+    echo "  mgr status --json             # Get full status as structured JSON"
+    echo "  mgr install-completion        # Install auto tab completion for bash/zsh"
     echo "  mgr mcp                       # Run as an MCP Server (for Claude, Cursor, Antigravity)"
     echo ""
     echo -e "${BOLD}CONFIG SEARCH ORDER:${NC}"
@@ -1215,6 +1375,11 @@ case "${FILTERED_ARGS[0]}" in
         show_help
         exit 0
         ;;
+    -c|--check|check|status)
+        load_services
+        cmd_status_check true false "$JSON_MODE" "${FILTERED_ARGS[@]:1}"
+        exit 0
+        ;;
     -r|--restart|restart|up|start)
         load_services
         cmd_start_or_restart "${FILTERED_ARGS[@]:1}" "$([ "$JSON_MODE" == "true" ] && echo "--json")"
@@ -1240,14 +1405,22 @@ case "${FILTERED_ARGS[0]}" in
         cmd_status_check true true false
         exit 0
         ;;
-    -c|--check|check|status)
-        load_services
-        cmd_status_check true false "$JSON_MODE"
-        exit 0
-        ;;
     *)
         load_services
-        cmd_start_or_restart "${FILTERED_ARGS[@]}" "$([ "$JSON_MODE" == "true" ] && echo "--json")"
-        exit 0
+        resolved=$(resolve_service "${FILTERED_ARGS[0]}")
+        entry=$(get_service_entry "$resolved" || true)
+        if [[ -n "$entry" ]]; then
+            echo -e "${YELLOW}[!] '${FILTERED_ARGS[0]}' is a service name, not a command.${NC}" >&2
+            echo -e "Please specify an action command first:" >&2
+            echo -e "  ${BOLD}mgr status ${FILTERED_ARGS[0]}${NC}     # View detailed service status" >&2
+            echo -e "  ${BOLD}mgr restart ${FILTERED_ARGS[0]}${NC}    # Start or restart service" >&2
+            echo -e "  ${BOLD}mgr stop ${FILTERED_ARGS[0]}${NC}       # Stop service" >&2
+            echo -e "  ${BOLD}mgr logs ${FILTERED_ARGS[0]}${NC}       # View live logs" >&2
+            exit 1
+        else
+            echo -e "${RED}[ERROR] Unknown command: '${FILTERED_ARGS[0]}'${NC}" >&2
+            echo -e "Run ${BOLD}mgr help${NC} to see available commands." >&2
+            exit 1
+        fi
         ;;
 esac
