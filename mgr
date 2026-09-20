@@ -278,6 +278,10 @@ get_pid() {
     local pid
     pid=$($s_ctl show "$unit" --property=MainPID 2>/dev/null | cut -d= -f2)
     if [[ -z "$pid" || "$pid" -eq 0 ]] 2>/dev/null; then
+        if [[ "$unit" == *"postgres"* ]]; then
+            pid=$(pgrep -f "postgres -D" 2>/dev/null | head -n 1 || echo "0")
+            [[ -n "$pid" && "$pid" -gt 0 ]] 2>/dev/null && { echo "$pid"; return 0; }
+        fi
         echo "0"
     else
         echo "$pid"
@@ -984,18 +988,27 @@ EOF
 }
 
 cmd_install_completion() {
-    local target_dir="${HOME}/.local/share/bash-completion/completions"
-    mkdir -p "$target_dir"
-    cmd_completion bash > "$target_dir/mgr"
-    echo -e "${GREEN}✓ Bash completion script installed to ${BOLD}$target_dir/mgr${NC}"
+    if [[ $EUID -eq 0 ]]; then
+        local target_file="/etc/bash_completion.d/mgr"
+        mkdir -p "/etc/bash_completion.d" 2>/dev/null || true
+        cmd_completion bash > "$target_file"
+        chmod 644 "$target_file"
+        echo -e "${GREEN}✓ System-wide Bash completion installed to ${BOLD}$target_file${NC}"
+        echo -e "${CYAN}Completion is active for all users in new shells, or run: ${BOLD}source $target_file${NC}"
+    else
+        local target_dir="${HOME}/.local/share/bash-completion/completions"
+        mkdir -p "$target_dir"
+        cmd_completion bash > "$target_dir/mgr"
+        echo -e "${GREEN}✓ Bash completion script installed to ${BOLD}$target_dir/mgr${NC}"
 
-    # Also register in ~/.bashrc if not already present
-    if ! grep -q "bash-completion/completions/mgr" "${HOME}/.bashrc" 2>/dev/null; then
-        echo -e "\n# mgr bash completion\n[ -f \"\$HOME/.local/share/bash-completion/completions/mgr\" ] && source \"\$HOME/.local/share/bash-completion/completions/mgr\"" >> "${HOME}/.bashrc"
+        # Also register in ~/.bashrc if not already present
+        if ! grep -q "bash-completion/completions/mgr" "${HOME}/.bashrc" 2>/dev/null; then
+            echo -e "\n# mgr bash completion\n[ -f \"\$HOME/.local/share/bash-completion/completions/mgr\" ] && source \"\$HOME/.local/share/bash-completion/completions/mgr\"" >> "${HOME}/.bashrc"
+        fi
+
+        echo -e "${GREEN}✓ Registered completion in ${BOLD}~/.bashrc${NC}"
+        echo -e "${CYAN}Run: ${BOLD}source ~/.bashrc${NC} or open a new terminal session to use tab completion immediately!${NC}"
     fi
-
-    echo -e "${GREEN}✓ Registered completion in ${BOLD}~/.bashrc${NC}"
-    echo -e "${CYAN}Run: ${BOLD}source ~/.bashrc${NC} or open a new terminal session to use tab completion immediately!${NC}"
 }
 
 # ------------------------------------------------------------------------------
